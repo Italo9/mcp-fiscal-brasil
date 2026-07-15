@@ -14,6 +14,7 @@ OpenAPI docs em http://localhost:8000/docs (Swagger UI).
 
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 from typing import Any, Literal
@@ -34,9 +35,20 @@ from .agentic import (
 )
 from .cep.client import CEPClient
 from .cnpj.tools import consultar_cnpj
+from .compat import (
+    cnpj_to_lumiere,
+    compliance_to_lumiere,
+    nfe_chave_to_lumiere,
+    nfe_to_lumiere,
+    sefaz_status_to_lumiere,
+    simples_to_lumiere,
+    supplier_to_lumiere,
+)
 from .cpf.tools import validar_cpf_tool
 from .ibge.client import IBGEClient
-from .nfe.tools import validar_chave_nfe
+from .nfe.tools import consultar_nfe, consultar_status_sefaz, validar_chave_nfe
+from .nfe.tools import UFS_VALIDAS
+from .nfe.xml_parser import parse_nfe_xml
 from .shared.validators import validate_cnpj
 from .simples.client import SimplesClient
 
@@ -127,7 +139,7 @@ def health() -> HealthResponse:
 async def cnpj_lookup(cnpj: str) -> dict[str, Any]:
     """Consulta dados cadastrais de uma empresa pelo CNPJ."""
     resultado = await consultar_cnpj(_validated_cnpj(cnpj))
-    return resultado.model_dump(mode="json", exclude_none=True)
+    return cnpj_to_lumiere(resultado.model_dump(mode="json", exclude_none=True))
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +178,7 @@ async def simples_lookup(cnpj: str) -> dict[str, Any]:
     """Consulta situacao da empresa no Simples Nacional."""
     client = SimplesClient()
     resultado = await client.get_simples_status(_validated_cnpj(cnpj))
-    return resultado.model_dump(mode="json", exclude_none=True)
+    return simples_to_lumiere(resultado.model_dump(mode="json", exclude_none=True))
 
 
 # ---------------------------------------------------------------------------
@@ -188,22 +200,81 @@ async def ibge_municipio(código: int) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-@app.get("/v1/nfe/chave/{chave}", tags=["nfe"], summary="Valida chave de acesso de NFe")
-async def nfe_chave_validate(chave: str) -> dict[str, Any]:
-    """Valida formato e digito verificador da chave de NFe."""
-    return await validar_chave_nfe(chave)
+@app.get("/v1/nfe/chave/{chave}", tags=["nfe"], summary="Consulta NFe por chave de acesso")
+async def nfe_chave_lookup(chave: str) -> dict[str, Any]:
+    """Consulta dados de NFe por chave de acesso (44 digitos).
+
+    Tenta consulta completa (BrasilAPI/Portal) primeiro; se falhar, retorna
+    apenas a validacao estrutural da chave.
+    """
+    chave_limpa = _only_digits(chave)
+    if len(chave_limpa) != 44:
+        raise HTTPException(status_code=400, detail="Chave de NFe deve ter 44 digitos")
+    try:
+        resultado = await consultar_nfe(chave_limpa)
+        return nfe_to_lumiere(resultado.model_dump(mode="json", exclude_none=True))
+    except Exception as exc:
+        logger.warning("nfe_full_lookup_failed", chave_prefix=chave_limpa[:10], error=str(exc))
+    validacao = await validar_chave_nfe(chave_limpa)
+    return nfe_chave_to_lumiere(chave_limpa, validacao)
+
+
+@app.get("/v1/nfe/status-sefaz", tags=["nfe"], summary="Status operacional das SEFAZ")
+async def nfe_status_sefaz(uf: str | None = Query(None, description="UF especifica (opcional)")) -> dict[str, Any]:
+    """Consulta status operacional dos webservices SEFAZ.
+
+    Sem parametro `uf`, consulta todas as UFs e retorna um array consolidado.
+    Com `uf`, consulta apenas a UF solicitada.
+    """
+    if uf:
+        resultado = await consultar_status_sefaz(uf)
+        return sefaz_status_to_lumiere([resultado.model_dump(mode="json", exclude_none=True)])
+
+    ufs = sorted(UFS_VALIDAS)
+    resultados: list[dict[str, Any]] = []
+
+    async def _consulta_uf(u: str) -> dict[str, Any] | None:
+        try:
+            r = await consultar_status_sefaz(u)
+            return r.model_dump(mode="json", exclude_none=True)
+        except Exception as exc:
+            logger.warning("sefaz_status_failed", uf=u, error=str(exc))
+            return None
+
+    tarefas = [_consulta_uf(u) for u in ufs]
+    concluidos = await asyncio.gather(*tarefas)
+    for r in concluidos:
+        if r is not None:
+            resultados.append(r)
+
+    return sefaz_status_to_lumiere(resultados)
 
 
 class NFeValidateRequest(BaseModel):
-    xml_path: str = Field(description="Caminho absoluto para arquivo XML da NFe.")
+    xml: str = Field(description="Conteudo XML da NFe (string, nao caminho de arquivo).")
+    xml_path: str | None = Field(default=None, description="Caminho absoluto para arquivo XML (legado).")
 
 
 @app.post("/v1/nfe/validate", tags=["nfe", "agentic"], summary="Validacao consolidada de NFe")
 async def nfe_validate_full(req: NFeValidateRequest) -> dict[str, Any]:
-    """Parse XML + válida chave + verifica situacao do emissor."""
-    xml_path = _validated_input_file(req.xml_path, label="Arquivo XML")
-    resultado = await validate_nfe_full(xml_path)
-    return resultado.model_dump(mode="json", exclude_none=True)
+    """Parse XML + valida chave + verifica situacao do emissor.
+
+    Aceita `xml` (conteudo string) ou `xml_path` (caminho de arquivo legado).
+    Retorna no formato compativel com o Lumiere.
+    """
+    if req.xml:
+        try:
+            resultado = parse_nfe_xml(req.xml, "")
+            return nfe_to_lumiere(resultado.model_dump(mode="json", exclude_none=True))
+        except Exception as exc:
+            logger.warning("nfe_xml_parse_failed", error=str(exc))
+            raise HTTPException(status_code=422, detail=f"XML invalido: {exc}") from exc
+    elif req.xml_path:
+        xml_path = _validated_input_file(req.xml_path, label="Arquivo XML")
+        resultado = await validate_nfe_full(xml_path)
+        return nfe_to_lumiere(resultado.model_dump(mode="json", exclude_none=True))
+    else:
+        raise HTTPException(status_code=400, detail="Forneça 'xml' (conteudo) ou 'xml_path' (caminho)")
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +307,7 @@ async def sped_summarize(req: SPEDSummarizeRequest) -> dict[str, Any]:
 async def agentic_compliance(cnpj: str) -> dict[str, Any]:
     """Compliance fiscal consolidado (CNPJ + Simples + MEI + CNAE)."""
     resultado = await analyze_cnpj_compliance(_validated_cnpj(cnpj))
-    return resultado.model_dump(mode="json", exclude_none=True)
+    return compliance_to_lumiere(resultado.model_dump(mode="json", exclude_none=True))
 
 
 @app.get(
@@ -249,7 +320,7 @@ async def agentic_supplier(
 ) -> dict[str, Any]:
     """Score de risco para due diligence de fornecedor."""
     resultado = await risk_score_supplier(_validated_cnpj(cnpj), criterios_estritos=estrito)
-    return resultado.model_dump(mode="json", exclude_none=True)
+    return supplier_to_lumiere(resultado.model_dump(mode="json", exclude_none=True))
 
 
 @app.get(
@@ -394,6 +465,6 @@ def run() -> None:
     """Entry point para o comando `mcp-fiscal-api`."""
     import uvicorn
 
-    host = os.environ.get("HOST", "127.0.0.1")
+    host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8000"))
     uvicorn.run("mcp_fiscal_brasil.api:app", host=host, port=port, reload=False)
