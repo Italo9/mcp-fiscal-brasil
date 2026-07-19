@@ -188,3 +188,33 @@ def test_sped_summarize_arquivo_inexistente_dentro_do_diretorio_permitido(
         json={"file_path": str(tmp_path / "nao_existe.txt")},
     )
     assert response.status_code == 404
+
+
+def test_fiscal_certificado_status_sem_certificado_configurado(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(api_settings, "nfe_certificado_path", "")
+    monkeypatch.setattr(api_settings, "nfe_certificado_senha", "")
+
+    response = client.get("/v1/fiscal/certificado/status")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["configurado"] is False
+    assert data["cnpj"] is None
+
+
+def test_status_sefaz_sem_certificado_nao_quebra_a_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sem certificado configurado, a rota degrada para 'sem dados' em vez de 500."""
+    monkeypatch.setattr(api_settings, "nfe_certificado_path", "")
+    monkeypatch.setattr(api_settings, "nfe_certificado_senha", "")
+
+    response_uf = client.get("/v1/nfe/status-sefaz", params={"uf": "SP"})
+    assert response_uf.status_code == 200
+    assert response_uf.json() == {"ufs": []}
+
+    response_todas = client.get("/v1/nfe/status-sefaz")
+    assert response_todas.status_code == 200
+    assert response_todas.json() == {"ufs": []}
