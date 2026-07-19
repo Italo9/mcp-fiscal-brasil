@@ -46,6 +46,7 @@ from .compat import (
 )
 from .cpf.tools import validar_cpf_tool
 from .ibge.client import IBGEClient
+from .nfe.status_sefaz import obter_status_certificado
 from .nfe.tools import consultar_nfe, consultar_status_sefaz, validar_chave_nfe
 from .nfe.tools import UFS_VALIDAS
 from .nfe.xml_parser import parse_nfe_xml
@@ -227,8 +228,12 @@ async def nfe_status_sefaz(uf: str | None = Query(None, description="UF especifi
     Com `uf`, consulta apenas a UF solicitada.
     """
     if uf:
-        resultado = await consultar_status_sefaz(uf)
-        return sefaz_status_to_lumiere([resultado.model_dump(mode="json", exclude_none=True)])
+        try:
+            resultado = await consultar_status_sefaz(uf)
+            return sefaz_status_to_lumiere([resultado.model_dump(mode="json", exclude_none=True)])
+        except Exception as exc:
+            logger.warning("sefaz_status_failed", uf=uf, error=str(exc))
+            return sefaz_status_to_lumiere([])
 
     ufs = sorted(UFS_VALIDAS)
     resultados: list[dict[str, Any]] = []
@@ -248,6 +253,35 @@ async def nfe_status_sefaz(uf: str | None = Query(None, description="UF especifi
             resultados.append(r)
 
     return sefaz_status_to_lumiere(resultados)
+
+
+@app.get(
+    "/v1/fiscal/certificado/status",
+    tags=["nfe"],
+    summary="Estado do certificado digital A1 configurado no servidor fiscal",
+)
+async def fiscal_certificado_status() -> dict[str, Any]:
+    """
+    Informa se ha certificado A1 configurado e seus metadados publicos.
+
+    Nunca expoe o arquivo do certificado ou a senha - apenas titular, CNPJ e
+    validade, para o painel Lumiere exibir "certificado configurado: sim/nao"
+    sem que o certificado em si transite pela loja.
+    """
+    resultado = obter_status_certificado(
+        caminho_certificado=settings.nfe_certificado_path,
+        senha=settings.nfe_certificado_senha,
+        ambiente=settings.nfe_ambiente,
+    )
+    return {
+        "configurado": resultado.configurado,
+        "ambiente": resultado.ambiente,
+        "cnpj": resultado.cnpj,
+        "titular": resultado.titular,
+        "validadeFim": resultado.validade_fim.isoformat() if resultado.validade_fim else None,
+        "valido": resultado.valido,
+        "erro": resultado.erro,
+    }
 
 
 class NFeValidateRequest(BaseModel):
